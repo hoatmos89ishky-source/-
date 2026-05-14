@@ -1,0 +1,45 @@
+name: Daily Stock Report
+
+on:
+  schedule:
+    # JST 月〜金 08:50 = UTC 日〜木 23:50
+    - cron: "50 23 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "テクニカル計算のみ（LLM/LINE をスキップ）"
+        required: false
+        default: "false"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+      LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
+      ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-4-7' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run report
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python -u main.py --dry-run
+          else
+            python -u main.py
+          fi
