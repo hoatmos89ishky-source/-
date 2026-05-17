@@ -1,7 +1,7 @@
 """Automated Daily Stock Recommender.
 
 JST 平日朝に GitHub Actions から実行され、為替・米国市場・日本株テクニカル
-指標を取得し、Claude が生成した相場見通しを LINE Messaging API で配信する。
+指標を取得し、Claude が生成した相場見通しを Gmail (SMTP) で配信する。
 """
 
 from __future__ import annotations
@@ -9,16 +9,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import smtplib
+import ssl
 import sys
 import time
 import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 from anthropic import Anthropic
 
@@ -30,8 +32,9 @@ from anthropic import Anthropic
 JST = timezone(timedelta(hours=9))
 
 DEFAULT_MODEL = "claude-opus-4-7"
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-LINE_TEXT_LIMIT = 4900  # LINE のテキスト上限 5000 に対し余裕を持たせる
+DEFAULT_MAIL_TO = "ho.atmos.89.ishky@gmail.com"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
 DISCLAIMER = (
     "※本情報は投資勧誘を目的としたものではなく、"
@@ -322,49 +325,31 @@ def generate_report(prompt: str, *, model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LINE 通知
+# Gmail 通知（SMTP + アプリパスワード）
 # ---------------------------------------------------------------------------
 
-def _chunk_text(text: str, limit: int) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = limit
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip("\n")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def send_line(message: str) -> None:
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    to_id = os.environ.get("LINE_TO_USER_ID")
-    if not token or not to_id:
+def send_gmail(subject: str, body: str) -> None:
+    sender = os.environ.get("GMAIL_SENDER")
+    password = os.environ.get("GMAIL_APP_PASSWORD")
+    recipient = os.environ.get("GMAIL_TO", DEFAULT_MAIL_TO)
+    if not sender or not password:
         raise RuntimeError(
-            "LINE_CHANNEL_ACCESS_TOKEN and LINE_TO_USER_ID must be set"
+            "GMAIL_SENDER and GMAIL_APP_PASSWORD must be set"
         )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    chunks = _chunk_text(message, LINE_TEXT_LIMIT)
-    # LINE push API は1リクエスト最大5メッセージ
-    for i in range(0, len(chunks), 5):
-        batch = chunks[i : i + 5]
-        body = {
-            "to": to_id,
-            "messages": [{"type": "text", "text": c} for c in batch],
-        }
-        resp = requests.post(LINE_PUSH_URL, headers=headers, json=body, timeout=30)
-        if resp.status_code >= 300:
-            raise RuntimeError(
-                f"LINE push failed: {resp.status_code} {resp.text}"
-            )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.set_content(body)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+        smtp.ehlo()
+        smtp.starttls(context=context)
+        smtp.ehlo()
+        smtp.login(sender, password)
+        smtp.send_message(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -414,8 +399,9 @@ def run(*, dry_run: bool, skip_llm: bool, skip_notify: bool, model: str) -> int:
     print(report)
 
     if not skip_notify:
-        send_line(report)
-        print("=== LINE push sent ===")
+        subject = f"[Daily Stock Report] {datetime.now(JST).strftime('%Y-%m-%d')}"
+        send_gmail(subject, report)
+        print("=== Gmail sent ===")
 
     return 0
 
@@ -427,7 +413,7 @@ def main() -> int:
     parser.add_argument("--skip-llm", action="store_true",
                         help="Claude 呼び出しをスキップ")
     parser.add_argument("--skip-notify", action="store_true",
-                        help="LINE 通知をスキップ")
+                        help="Gmail 通知をスキップ")
     parser.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL),
                         help="使用する Claude モデル ID")
     args = parser.parse_args()
@@ -444,9 +430,11 @@ def main() -> int:
         print(tb, file=sys.stderr)
         if not args.dry_run and not args.skip_notify:
             try:
-                send_line(
-                    "⚠️ Daily Stock Recommender でエラーが発生しました。\n"
-                    "GitHub Actions のログを確認してください。"
+                send_gmail(
+                    "[Daily Stock Report] ERROR",
+                    "Daily Stock Recommender でエラーが発生しました。\n"
+                    "GitHub Actions のログを確認してください。\n\n"
+                    f"{tb}",
                 )
             except Exception:  # noqa: BLE001
                 pass
