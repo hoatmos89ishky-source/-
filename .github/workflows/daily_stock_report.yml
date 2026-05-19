@@ -2,23 +2,24 @@ name: Daily Stock Report
 
 on:
   schedule:
-    # JST 月〜金 08:50 = UTC 日〜木 23:50
-    - cron: "50 23 * * 0-4"
+    # JST 月〜金 07:30 = UTC 日〜木 22:30
+    - cron: "30 22 * * 0-4"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "テクニカル計算のみ（LLM/LINE をスキップ）"
+        description: "テクニカル計算のみ（LLM/メールをスキップ）"
         required: false
         default: "false"
 
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      HOLDINGS_JSON: ${{ secrets.HOLDINGS_JSON }}
       GMAIL_TO: ${{ vars.GMAIL_TO || 'ho.atmos.89.ishky@gmail.com' }}
       ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-4-7' }}
       PYTHONUNBUFFERED: "1"

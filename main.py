@@ -1,7 +1,9 @@
-"""Automated Daily Stock Recommender.
+"""Automated Daily Stock Recommender (v2).
 
-JST 平日朝に GitHub Actions から実行され、為替・米国市場・日本株テクニカル
-指標を取得し、Claude が生成した相場見通しを Gmail (SMTP) で配信する。
+JST 平日 07:30 (UTC 22:30) に GitHub Actions cron で実行され、為替・米国市場・
+日経主要構成銘柄のテクニカル指標と、ユーザーの保有株・保有投信の動向を
+取得し、Claude (web_search ツール経由で最新決算・ニュース・世情を踏まえる)
+が生成したレポートを Gmail で配信する。
 """
 
 from __future__ import annotations
@@ -49,21 +51,45 @@ US_TICKERS: dict[str, str] = {
     "NVDA": "NVIDIA",
 }
 
-# 日本市場・指数
 JP_INDEX = ("^N225", "日経平均")
 
-# 既定ウォッチリスト（要件記載の銘柄）
-# value はセクター分類（"export" / "domestic" / "financial"）と銘柄名のタプル
-WATCHLIST: dict[str, tuple[str, str]] = {
-    "7203.T": ("export", "トヨタ自動車"),
-    "7272.T": ("export", "ヤマハ発動機"),
-    "4755.T": ("domestic", "楽天グループ"),
-    "8306.T": ("financial", "三菱UFJフィナンシャル・グループ"),
-}
+# 日経225 構成銘柄から流動性・知名度上位 30 銘柄
+JP_UNIVERSE: list[tuple[str, str]] = [
+    ("7203.T", "トヨタ自動車"),
+    ("6758.T", "ソニーグループ"),
+    ("9984.T", "ソフトバンクグループ"),
+    ("9983.T", "ファーストリテイリング"),
+    ("8035.T", "東京エレクトロン"),
+    ("4063.T", "信越化学工業"),
+    ("8306.T", "三菱UFJフィナンシャル・グループ"),
+    ("9433.T", "KDDI"),
+    ("9432.T", "NTT"),
+    ("6861.T", "キーエンス"),
+    ("7974.T", "任天堂"),
+    ("6098.T", "リクルートホールディングス"),
+    ("6594.T", "ニデック"),
+    ("4502.T", "武田薬品工業"),
+    ("4568.T", "第一三共"),
+    ("8316.T", "三井住友フィナンシャルグループ"),
+    ("8411.T", "みずほフィナンシャルグループ"),
+    ("8001.T", "伊藤忠商事"),
+    ("8058.T", "三菱商事"),
+    ("8031.T", "三井物産"),
+    ("6501.T", "日立製作所"),
+    ("6902.T", "デンソー"),
+    ("7267.T", "本田技研工業"),
+    ("6954.T", "ファナック"),
+    ("6981.T", "村田製作所"),
+    ("6367.T", "ダイキン工業"),
+    ("4452.T", "花王"),
+    ("2914.T", "JT"),
+    ("9020.T", "JR東日本"),
+    ("9022.T", "JR東海"),
+]
 
 
 # ---------------------------------------------------------------------------
-# データ取得層
+# データ取得層（yfinance ラッパー）
 # ---------------------------------------------------------------------------
 
 def _download(ticker: str, *, period: str, interval: str) -> pd.DataFrame:
@@ -91,15 +117,14 @@ def _download(ticker: str, *, period: str, interval: str) -> pd.DataFrame:
 
 
 def fetch_fx() -> dict[str, Any]:
-    """ドル円の直近1週間トレンドを取得。"""
     df = _download("JPY=X", period="10d", interval="1d").tail(5)
     closes = df["Close"].astype(float)
     first, last = float(closes.iloc[0]), float(closes.iloc[-1])
     change_pct = (last - first) / first * 100.0
     if change_pct >= 0.5:
-        bias = "yen_weak"  # 円安方向
+        bias = "yen_weak"
     elif change_pct <= -0.5:
-        bias = "yen_strong"  # 円高方向
+        bias = "yen_strong"
     else:
         bias = "neutral"
     return {
@@ -114,22 +139,24 @@ def fetch_fx() -> dict[str, Any]:
 
 
 def fetch_us_market() -> list[dict[str, Any]]:
-    """米国主要指数・銘柄の前日終値と前日比。"""
     out: list[dict[str, Any]] = []
     for symbol, label in US_TICKERS.items():
-        df = _download(symbol, period="5d", interval="1d")
+        try:
+            df = _download(symbol, period="5d", interval="1d")
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: us {symbol} failed: {exc}", file=sys.stderr)
+            continue
         closes = df["Close"].astype(float).dropna()
         if len(closes) < 2:
             continue
         prev, last = float(closes.iloc[-2]), float(closes.iloc[-1])
-        change_pct = (last - prev) / prev * 100.0
         out.append(
             {
                 "symbol": symbol,
                 "name": label,
                 "close": round(last, 2),
                 "prev_close": round(prev, 2),
-                "change_pct": round(change_pct, 2),
+                "change_pct": round((last - prev) / prev * 100.0, 2),
                 "date": closes.index[-1].strftime("%Y-%m-%d"),
             }
         )
@@ -160,7 +187,6 @@ def fetch_jp_index() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def calc_rsi(closes: pd.Series, period: int = 14) -> float | None:
-    """Wilder の RSI（直近値）を返す。"""
     if len(closes) < period + 1:
         return None
     delta = closes.diff().dropna()
@@ -185,136 +211,252 @@ def calc_ma(closes: pd.Series, window: int) -> float | None:
 class StockSnapshot:
     symbol: str
     name: str
-    sector: str
     close: float
-    change_pct: float
+    change_pct_1d: float
+    change_pct_5d: float | None
+    change_pct_30d: float | None
     ma25: float | None
     deviation_pct_25ma: float | None
     ma26w: float | None
     rsi14: float | None
-    is_pullback_candidate: bool
     date: str
 
 
-def analyze_stock(symbol: str, sector: str, name: str) -> StockSnapshot | None:
-    daily = _download(symbol, period="6mo", interval="1d")
-    weekly = _download(symbol, period="2y", interval="1wk")
+def analyze_stock(symbol: str, name: str) -> StockSnapshot | None:
+    try:
+        daily = _download(symbol, period="6mo", interval="1d")
+        weekly = _download(symbol, period="2y", interval="1wk")
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: analyze_stock failed for {symbol}: {exc}", file=sys.stderr)
+        return None
+
     d_closes = daily["Close"].astype(float).dropna()
     w_closes = weekly["Close"].astype(float).dropna()
-    if d_closes.empty:
+    if len(d_closes) < 2:
         return None
 
     last = float(d_closes.iloc[-1])
-    prev = float(d_closes.iloc[-2]) if len(d_closes) >= 2 else last
+    prev = float(d_closes.iloc[-2])
     ma25 = calc_ma(d_closes, 25)
     deviation = (
         round((last - ma25) / ma25 * 100.0, 2) if ma25 is not None else None
     )
-    ma26w = calc_ma(w_closes, 26)
-    rsi14 = calc_rsi(d_closes, 14)
 
-    is_pullback = (
-        rsi14 is not None
-        and deviation is not None
-        and rsi14 <= 30.0
-        and abs(deviation) <= 3.0
-    )
+    def pct_back(n: int) -> float | None:
+        if len(d_closes) > n:
+            base = float(d_closes.iloc[-1 - n])
+            if base > 0:
+                return round((last - base) / base * 100.0, 2)
+        return None
 
     return StockSnapshot(
         symbol=symbol,
         name=name,
-        sector=sector,
         close=round(last, 2),
-        change_pct=round((last - prev) / prev * 100.0, 2),
+        change_pct_1d=round((last - prev) / prev * 100.0, 2),
+        change_pct_5d=pct_back(5),
+        change_pct_30d=pct_back(20),  # 20 営業日 ≒ 1ヶ月
         ma25=ma25,
         deviation_pct_25ma=deviation,
-        ma26w=ma26w,
-        rsi14=rsi14,
-        is_pullback_candidate=is_pullback,
+        ma26w=calc_ma(w_closes, 26),
+        rsi14=calc_rsi(d_closes, 14),
         date=d_closes.index[-1].strftime("%Y-%m-%d"),
     )
 
 
+def screen_universe() -> list[StockSnapshot]:
+    out: list[StockSnapshot] = []
+    for symbol, name in JP_UNIVERSE:
+        snap = analyze_stock(symbol, name)
+        if snap is not None:
+            out.append(snap)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# シグナル判定（為替バイアス → セクター優先）
+# 保有情報
 # ---------------------------------------------------------------------------
 
-def sector_focus(fx_bias: str) -> list[str]:
-    """為替バイアスから優先セクターを返す。"""
-    if fx_bias == "yen_weak":
-        return ["export"]
-    if fx_bias == "yen_strong":
-        return ["domestic", "financial"]
-    return []
+def load_holdings() -> dict[str, list[dict[str, Any]]]:
+    raw = os.environ.get("HOLDINGS_JSON", "")
+    if not raw.strip():
+        return {"stocks": [], "funds": []}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"WARN: HOLDINGS_JSON parse error: {exc}", file=sys.stderr)
+        return {"stocks": [], "funds": []}
+    return {
+        "stocks": list(data.get("stocks", []) or []),
+        "funds": list(data.get("funds", []) or []),
+    }
 
 
-def rank_watchlist(
-    snapshots: list[StockSnapshot], priority_sectors: list[str]
-) -> list[StockSnapshot]:
-    """優先セクターを先頭に、押し目買い候補を上位に並べ替える。"""
-    def key(s: StockSnapshot) -> tuple[int, int, float]:
-        sector_rank = (
-            priority_sectors.index(s.sector)
-            if s.sector in priority_sectors
-            else len(priority_sectors)
+def _fetch_news_titles(symbol: str) -> list[str]:
+    try:
+        ticker = yf.Ticker(symbol)
+        news_list = getattr(ticker, "news", None) or []
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: news fetch failed for {symbol}: {exc}", file=sys.stderr)
+        return []
+    titles: list[str] = []
+    for n in news_list[:5]:
+        if not isinstance(n, dict):
+            continue
+        title = n.get("title")
+        if not title and isinstance(n.get("content"), dict):
+            title = n["content"].get("title")
+        if title:
+            titles.append(str(title))
+    return titles
+
+
+def _fetch_next_earnings(symbol: str) -> str | None:
+    try:
+        ticker = yf.Ticker(symbol)
+        cal = getattr(ticker, "calendar", None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: calendar fetch failed for {symbol}: {exc}", file=sys.stderr)
+        return None
+    if cal is None:
+        return None
+    try:
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            if "Earnings Date" in cal.index:
+                v = cal.loc["Earnings Date"].iloc[0]
+                return str(v)[:10]
+            return None
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if isinstance(ed, list) and ed:
+                return str(ed[0])[:10]
+            if ed:
+                return str(ed)[:10]
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: calendar parse failed for {symbol}: {exc}", file=sys.stderr)
+    return None
+
+
+def fetch_holding_stock_context(stock: dict[str, Any]) -> dict[str, Any]:
+    symbol = stock.get("symbol", "")
+    name = stock.get("name") or symbol
+    shares = stock.get("shares")
+    avg_cost = stock.get("avg_cost")
+
+    snap = analyze_stock(symbol, name)
+    if snap is None:
+        return {"symbol": symbol, "name": name, "error": "data unavailable"}
+
+    ctx = asdict(snap)
+    ctx["shares"] = shares
+    ctx["avg_cost"] = avg_cost
+    if (
+        shares is not None
+        and avg_cost is not None
+        and isinstance(avg_cost, (int, float))
+        and avg_cost > 0
+    ):
+        unrealized = (snap.close - avg_cost) * shares
+        ctx["unrealized_pl"] = round(float(unrealized), 2)
+        ctx["unrealized_pl_pct"] = round(
+            (snap.close - avg_cost) / avg_cost * 100.0, 2
         )
-        pullback_rank = 0 if s.is_pullback_candidate else 1
-        rsi_rank = s.rsi14 if s.rsi14 is not None else 100.0
-        return (sector_rank, pullback_rank, rsi_rank)
 
-    return sorted(snapshots, key=key)
+    ctx["news_titles"] = _fetch_news_titles(symbol)
+    ctx["next_earnings"] = _fetch_next_earnings(symbol)
+    return ctx
 
 
 # ---------------------------------------------------------------------------
-# レポート生成（Claude）
+# レポート生成（Claude + Web Search Tool）
 # ---------------------------------------------------------------------------
 
 def build_prompt(
     fx: dict[str, Any],
     us: list[dict[str, Any]],
     jp_index: dict[str, Any],
-    snapshots: list[StockSnapshot],
-    priority_sectors: list[str],
+    universe: list[StockSnapshot],
+    holdings_ctx: dict[str, Any],
 ) -> str:
     payload = {
         "as_of_jst": datetime.now(JST).strftime("%Y-%m-%d %H:%M"),
         "fx": fx,
         "us_market_prev_close": us,
         "jp_index": jp_index,
-        "watchlist": [asdict(s) for s in snapshots],
-        "priority_sectors": priority_sectors,
-        "pullback_candidates": [
-            s.symbol for s in snapshots if s.is_pullback_candidate
-        ],
+        "universe_snapshots": [asdict(s) for s in universe],
+        "holdings": holdings_ctx,
     }
     data = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    has_stocks = bool(holdings_ctx.get("stocks"))
+    has_funds = bool(holdings_ctx.get("funds"))
+    if not has_stocks and not has_funds:
+        holdings_note = "保有情報は未設定のため、セクション4・5・6は省略してください。\n"
+    elif not has_funds:
+        holdings_note = "保有投信が未設定のため、セクション6は省略してください。\n"
+    elif not has_stocks:
+        holdings_note = "保有株が未設定のため、セクション4・5は省略してください。\n"
+    else:
+        holdings_note = ""
+
     return (
-        "あなたは日本株を専門とする経験豊富な相場アナリストです。"
-        "以下の JSON データ（為替・米国市場前日終値・日経平均・"
-        "日本株ウォッチリストのテクニカル指標）を踏まえ、"
-        "本日（東京市場寄り付き前）のレポートを日本語で作成してください。\n\n"
-        "出力は次のセクション構成で、合計1200文字以内・LINE で読みやすい体裁に:\n"
-        "【相場見通し】 3〜4行で本日の地合いを総括。\n"
-        "【為替・外部環境】 ドル円バイアスと米国市場の影響を簡潔に。\n"
-        "【注目銘柄】 ウォッチリストから1〜3銘柄を選び、"
-        "各銘柄について『銘柄名(コード) / 終値 / 25MA乖離率 / RSI / 26週MA との位置関係』"
-        "を必ず根拠として明示し、押し目買い候補があれば優先的に取り上げる。\n"
-        "数値は提供データのみを使用し、推測しないこと。"
-        "末尾の免責事項はこちらで付与するので本文には含めないこと。\n\n"
+        "あなたは経験豊富な日本株アナリスト兼ポートフォリオマネージャーです。"
+        "本日（JST 朝、東京市場寄り付き前）に Gmail で読みやすい日本語レポートを作成してください。\n\n"
+        "必要に応じて web_search ツールを使い、保有銘柄の最新決算 / IR / ニュース / 世の情勢を確認し、"
+        "売却タイミング判断は鋭く具体的に。投資信託はファンド名から最新の基準価額方向感と関連ニュースを"
+        "Web 検索でコメントすること。\n\n"
+        "出力フォーマット（合計 2000 文字以内、見出しは【】で囲む）:\n"
+        "1. 【相場見通し】 3〜4行で本日の地合いを総括。\n"
+        "2. 【為替・米国市場】 ドル円バイアスと米国前日終値の影響を簡潔に。\n"
+        "3. 【今日のおすすめ10銘柄】 universe_snapshots から銘柄を10件選び、"
+        "『銘柄名(コード) / 終値 / 1〜2行の理由』を箇条書きで。"
+        "為替バイアス（円安なら輸出、円高なら内需・金融）と RSI / 25MA 乖離率を踏まえて選定。\n"
+        "4. 【保有銘柄の動向】 各保有株について"
+        "『銘柄名(コード) / 終値 / 1日 / 5日 / 30日 / 含み損益(円・％) / RSI / 25MA乖離率』を1行で。\n"
+        "5. 【保有銘柄の売却判断】 各保有株を HOLD / WATCH / TRIM / SELL の4段階で判定し、"
+        "決算予定・最新ニュース・テクニカル・マクロ環境を踏まえた根拠を1〜2行で。\n"
+        "6. 【保有投信のコメント】 ファンド名ごとに Web 検索結果ベースで「直近の方向感・注目材料」を1〜2行で。\n\n"
+        f"{holdings_note}"
+        "注意: 数値は提供 JSON を優先し、推測時は『推定』と明記。"
+        "本日が日本の祝日（東証休場）と思われる場合は冒頭にその旨を注記。"
+        "末尾の免責事項はプログラム側で付与するので本文には含めない。\n\n"
         f"```json\n{data}\n```"
     )
 
 
-def generate_report(prompt: str, *, model: str) -> str:
+def generate_report(prompt: str, *, model: str, use_web_search: bool = True) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
     client = Anthropic(api_key=api_key)
-    resp = client.messages.create(
-        model=model,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 4000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if use_web_search:
+        kwargs["tools"] = [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 8,
+            }
+        ]
+
+    resp = client.messages.create(**kwargs)
+
+    # web_search は server-side ツールのため通常は1回の呼び出しで完結する。
+    # 念のため stop_reason が tool_use のままなら、assistant の content を
+    # 会話に追加して継続呼び出しする（safety loop）。
+    safety = 0
+    while getattr(resp, "stop_reason", None) == "tool_use" and safety < 5:
+        safety += 1
+        kwargs["messages"] = kwargs["messages"] + [
+            {"role": "assistant", "content": resp.content}
+        ]
+        resp = client.messages.create(**kwargs)
+
     parts: list[str] = []
     for block in resp.content:
         text = getattr(block, "text", None)
@@ -356,52 +498,77 @@ def send_gmail(subject: str, body: str) -> None:
 # メイン
 # ---------------------------------------------------------------------------
 
-def collect_snapshots() -> list[StockSnapshot]:
-    out: list[StockSnapshot] = []
-    for symbol, (sector, name) in WATCHLIST.items():
-        snap = analyze_stock(symbol, sector, name)
-        if snap is not None:
-            out.append(snap)
-    return out
+def run(
+    *,
+    dry_run: bool,
+    skip_llm: bool,
+    skip_notify: bool,
+    model: str,
+    no_web_search: bool,
+) -> int:
+    started = datetime.now(JST)
+    print(f"=== Run start: {started.strftime('%Y-%m-%d %H:%M:%S JST')} ===")
 
-
-def run(*, dry_run: bool, skip_llm: bool, skip_notify: bool, model: str) -> int:
     fx = fetch_fx()
     us = fetch_us_market()
     jp_index = fetch_jp_index()
-    snapshots = collect_snapshots()
-    priority = sector_focus(fx["bias"])
-    ranked = rank_watchlist(snapshots, priority)
-
     print("=== FX ===")
     print(json.dumps(fx, ensure_ascii=False, indent=2))
     print("=== US Market (prev close) ===")
     print(json.dumps(us, ensure_ascii=False, indent=2))
     print("=== JP Index ===")
     print(json.dumps(jp_index, ensure_ascii=False, indent=2))
-    print("=== Watchlist ===")
-    print(json.dumps([asdict(s) for s in ranked], ensure_ascii=False, indent=2))
-    print(f"=== Priority sectors: {priority} ===")
+
+    universe = screen_universe()
+    print(f"=== Universe screened: {len(universe)}/{len(JP_UNIVERSE)} stocks ===")
+
+    holdings_raw = load_holdings()
+    print(
+        f"=== Holdings input: {len(holdings_raw['stocks'])} stocks, "
+        f"{len(holdings_raw['funds'])} funds ==="
+    )
+    holdings_ctx: dict[str, Any] = {
+        "stocks": [fetch_holding_stock_context(s) for s in holdings_raw["stocks"]],
+        "funds": holdings_raw["funds"],
+    }
 
     if dry_run:
+        # dry-run のときのみ保有情報の詳細を出力
+        print("=== Universe snapshots (dry-run) ===")
+        print(json.dumps([asdict(s) for s in universe], ensure_ascii=False, indent=2))
+        print("=== Holdings context (dry-run) ===")
+        print(json.dumps(holdings_ctx, ensure_ascii=False, indent=2))
         return 0
 
     if skip_llm:
-        report = "（LLM スキップ: テクニカル要約のみ）\n" + json.dumps(
-            {"fx_bias": fx["bias"], "priority": priority}, ensure_ascii=False
+        report = (
+            "(LLM スキップ)\n"
+            f"universe: {[s.symbol for s in universe]}\n"
+            f"holdings stocks: {[s.get('symbol') for s in holdings_ctx['stocks']]}\n"
+            f"holdings funds: {[f.get('name') for f in holdings_ctx['funds']]}\n\n"
+            f"{DISCLAIMER}"
         )
-        report = f"{report}\n\n{DISCLAIMER}"
     else:
-        prompt = build_prompt(fx, us, jp_index, ranked, priority)
-        report = generate_report(prompt, model=model)
+        prompt = build_prompt(fx, us, jp_index, universe, holdings_ctx)
+        report = generate_report(
+            prompt, model=model, use_web_search=not no_web_search
+        )
 
-    print("=== Report ===")
-    print(report)
+    print(f"=== Report length: {len(report)} chars ===")
 
     if not skip_notify:
         subject = f"[Daily Stock Report] {datetime.now(JST).strftime('%Y-%m-%d')}"
         send_gmail(subject, report)
-        print("=== Gmail sent ===")
+        finished = datetime.now(JST)
+        elapsed = (finished - started).total_seconds()
+        print(
+            f"=== Gmail sent at {finished.strftime('%H:%M:%S JST')} "
+            f"(elapsed {elapsed:.1f}s) ==="
+        )
+    else:
+        print("=== (skip notify) ===")
+        preview = report[:500] + ("..." if len(report) > 500 else "")
+        print(preview)
 
     return 0
 
@@ -414,8 +581,13 @@ def main() -> int:
                         help="Claude 呼び出しをスキップ")
     parser.add_argument("--skip-notify", action="store_true",
                         help="Gmail 通知をスキップ")
-    parser.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL),
-                        help="使用する Claude モデル ID")
+    parser.add_argument("--no-web-search", action="store_true",
+                        help="Claude の Web Search ツールを無効化")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL),
+        help="使用する Claude モデル ID",
+    )
     args = parser.parse_args()
 
     try:
@@ -424,6 +596,7 @@ def main() -> int:
             skip_llm=args.skip_llm,
             skip_notify=args.skip_notify,
             model=args.model,
+            no_web_search=args.no_web_search,
         )
     except Exception:  # noqa: BLE001
         tb = traceback.format_exc()
