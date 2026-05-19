@@ -14,3 +14,10 @@ env/
 
 *.log
 .cache/
+
+# 保有情報・楽天 CSV エクスポート（機密）
+holdings.json
+holdings.csv
+stocks*.csv
+funds*.csv
+*_holdings*.csv

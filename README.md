@@ -40,6 +40,8 @@
 .
 ├── main.py                                   # メインロジック
 ├── requirements.txt                          # 依存ライブラリ
+├── tools/
+│   └── import_rakuten.py                     # 楽天証券 CSV → HOLDINGS_JSON 変換
 ├── .github/workflows/daily_stock_report.yml  # cron 定義
 └── README.md
 ```
@@ -83,27 +85,50 @@ Gmail SMTP は通常パスワードでなく**アプリパスワード**を使�
 3. 表示される **16文字のパスワード**（スペース無しで貼り付け）を `GMAIL_APP_PASSWORD` に登録
 4. `GMAIL_SENDER` に送信元の Gmail アドレスを登録
 
-### 5. 保有情報 `HOLDINGS_JSON` の登録（任意だが推奨）
+### 5. 保有情報 `HOLDINGS_JSON` の登録（任意）
 
-保有株・保有投信を Bot に教えるための JSON 文字列を `HOLDINGS_JSON` Secret に格納します。
+保有株・保有投信を Bot に教えるための JSON 文字列を `HOLDINGS_JSON` Secret に格納します。**未設定でも動作**し、その場合は保有関連セクションが省略されます。
+
+#### 5-A. 楽天証券 CSV から自動生成（推奨）
+
+楽天証券は公開 API を提供していないため完全自動連携はできませんが、CSV エクスポートを変換するツール `tools/import_rakuten.py` を同梱しています。
+
+1. 楽天証券Web > マイメニュー > **保有商品一覧** > **CSV ダウンロード**（株式・投信それぞれ）
+2. ローカルで変換:
+   ```bash
+   python tools/import_rakuten.py stocks.csv funds.csv > holdings.json
+   ```
+   - 一般 / 特定 / NISA に分かれた同一銘柄は数量加重平均で自動集約されます
+   - CP932 / Shift-JIS / UTF-8 を自動判別
+3. 出力された JSON を `HOLDINGS_JSON` Secret に貼り付け（`holdings.json` 自体はリポジトリにコミットしないでください）
+4. 保有銘柄が変わったときだけ再実行（数ヶ月に1回でOK）
+
+詳しくは `tools/import_rakuten.py` の docstring 参照。
+
+#### 5-B. 手書きする場合の JSON フォーマット
+
+> ⚠️ **以下の値はサンプルです。必ずご自身の実際の保有銘柄に書き換えてください**（コピー＆ペーストするとこの架空の保有内容で Bot が動作します）。
 
 ```json
 {
   "stocks": [
-    {"symbol": "7203.T", "name": "トヨタ自動車", "shares": 100, "avg_cost": 2800},
-    {"symbol": "9984.T", "name": "ソフトバンクG", "shares": 50, "avg_cost": 8500}
+    {"symbol": "XXXX.T", "name": "（あなたの保有銘柄名）", "shares": 100, "avg_cost": 1500}
   ],
   "funds": [
-    {"name": "eMAXIS Slim 全世界株式（オール・カントリー）"},
-    {"name": "eMAXIS Slim 米国株式（S&P500）"}
+    {"name": "（あなたの保有ファンド名）"}
   ]
 }
+```
+
+何も保有していない・保有関連セクションを省略したい場合は次のようにします:
+
+```json
+{"stocks": [], "funds": []}
 ```
 
 - `symbol` は yfinance 形式（東証銘柄は `XXXX.T`）
 - `shares` / `avg_cost` は省略可（省略時は含み損益計算をスキップ）
 - 投資信託は **ファンド名だけ**保持し、価格データは Claude が Web 検索でカバーします
-- 未設定（空文字）なら保有関連セクションは省略され、おすすめ10銘柄＋市場概況のみ届きます
 
 > ⚠️ `HOLDINGS_JSON` は **Secret** タブに登録してください。Variables ではログに出るリスクがあります。
 
@@ -122,8 +147,8 @@ Gmail SMTP は通常パスワードでなく**アプリパスワード**を使�
 # 1) データ取得とテクニカル計算のみ（API 未設定でも動く）
 python main.py --dry-run
 
-# 2) 保有情報込みドライラン
-HOLDINGS_JSON='{"stocks":[{"symbol":"7203.T","shares":100,"avg_cost":2800}],"funds":[]}' \
+# 2) 保有情報込みドライラン（XXXX を実際の銘柄コードに置換して試す）
+HOLDINGS_JSON='{"stocks":[{"symbol":"XXXX.T","shares":100,"avg_cost":1500}],"funds":[]}' \
   python main.py --dry-run
 
 # 3) Claude までは呼ぶがメール送信はしない
