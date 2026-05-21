@@ -25,17 +25,26 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 
-SYMBOL_COL = ["銘柄コード", "コード"]
-NAME_COL_STOCK = ["銘柄名", "銘柄"]
-SHARES_COL = ["保有数量", "数量", "残数量", "残高"]
-COST_COL = ["平均取得単価", "取得単価", "取得平均単価", "平均単価"]
-NAME_COL_FUND = ["ファンド名", "投資信託", "銘柄名"]
+SYMBOL_COL = ["銘柄コード", "コード", "ティッカー"]
+NAME_COL_STOCK = ["銘柄名称", "銘柄名", "銘柄"]
+SHARES_COL = [
+    "保有株数", "保有数量", "保有数", "残数量",
+    "株数", "数量", "残数", "残高",
+]
+COST_COL = [
+    "平均取得価額", "平均取得単価", "取得平均価額", "取得平均単価",
+    "取得価額", "取得単価", "平均単価", "平均価額",
+]
+NAME_COL_FUND = ["ファンド名", "投資信託", "銘柄名称", "銘柄名"]
+
+SYMBOL_RE = re.compile(r"^\s*(\d{4,5})")
 
 
 def _decode(raw: bytes) -> str:
@@ -94,8 +103,8 @@ def _to_number(s: str) -> float | None:
 
 def detect_kind(header: list[str]) -> str | None:
     has_symbol = _find_col(header, SYMBOL_COL) is not None
-    has_cost = _find_col(header, COST_COL) is not None
-    if has_symbol and has_cost:
+    has_shares = _find_col(header, SHARES_COL) is not None
+    if has_symbol and has_shares:
         return "stocks"
     if any("ファンド" in h or "投資信託" in h for h in header):
         return "funds"
@@ -103,31 +112,63 @@ def detect_kind(header: list[str]) -> str | None:
 
 
 def parse_stock_lots(
-    header: list[str], rows: list[list[str]]
+    header: list[str],
+    rows: list[list[str]],
+    *,
+    verbose: bool = False,
 ) -> list[tuple[str, str, float, float | None]]:
     """株式 CSV の各行を (symbol, name, shares, avg_cost_or_none) で返す。"""
     sym_i = _find_col(header, SYMBOL_COL)
     name_i = _find_col(header, NAME_COL_STOCK)
     shares_i = _find_col(header, SHARES_COL)
     cost_i = _find_col(header, COST_COL)
+    if verbose:
+        def _label(i: int | None) -> str | None:
+            return header[i] if i is not None else None
+        print(
+            f"  columns: symbol={_label(sym_i)} "
+            f"name={_label(name_i)} "
+            f"shares={_label(shares_i)} "
+            f"cost={_label(cost_i)}",
+            file=sys.stderr,
+        )
     if sym_i is None or shares_i is None:
         return []
 
     out: list[tuple[str, str, float, float | None]] = []
+    rejected = 0
     for row in rows:
         max_idx = max(i for i in (sym_i, name_i, shares_i, cost_i) if i is not None)
         if len(row) <= max_idx:
+            rejected += 1
+            if verbose and rejected <= 3:
+                print(f"  reject (short row): {row}", file=sys.stderr)
             continue
         raw_sym = row[sym_i].strip()
-        if not raw_sym or not raw_sym.isdigit():
+        m = SYMBOL_RE.match(raw_sym)
+        if not m:
+            rejected += 1
+            if verbose and rejected <= 3:
+                print(
+                    f"  reject (symbol not 4-5 digits): {row[sym_i]!r}",
+                    file=sys.stderr,
+                )
             continue
-        symbol = f"{raw_sym}.T"
+        symbol = f"{m.group(1)}.T"
         name = row[name_i].strip() if name_i is not None else symbol
         shares = _to_number(row[shares_i])
         if shares is None or shares <= 0:
+            rejected += 1
+            if verbose and rejected <= 3:
+                print(
+                    f"  reject (shares invalid): sym={raw_sym} shares={row[shares_i]!r}",
+                    file=sys.stderr,
+                )
             continue
         cost = _to_number(row[cost_i]) if cost_i is not None else None
         out.append((symbol, name, shares, cost))
+    if verbose and rejected > 0:
+        print(f"  rejected total: {rejected} rows", file=sys.stderr)
     return out
 
 
@@ -181,6 +222,12 @@ def main() -> int:
         nargs="+",
         help="楽天証券からダウンロードした CSV (株式 / 投信、複数可)",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="列マッピングと拒否行をstderrに出力（デバッグ用）",
+    )
     args = parser.parse_args()
 
     all_lots: list[tuple[str, str, float, float | None]] = []
@@ -195,9 +242,11 @@ def main() -> int:
         if not header:
             print(f"WARN: {path} has no recognizable header", file=sys.stderr)
             continue
+        if args.verbose:
+            print(f"INFO: {path.name} header: {header}", file=sys.stderr)
         kind = detect_kind(header)
         if kind == "stocks":
-            lots = parse_stock_lots(header, data)
+            lots = parse_stock_lots(header, data, verbose=args.verbose)
             all_lots.extend(lots)
             print(
                 f"INFO: {path.name} → stocks {len(lots)} lots", file=sys.stderr
@@ -212,7 +261,8 @@ def main() -> int:
             )
         else:
             print(
-                f"WARN: {path.name} kind unknown (header sample: {header[:6]})",
+                f"WARN: {path.name} kind unknown. "
+                f"header: {header}",
                 file=sys.stderr,
             )
 
