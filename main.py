@@ -17,10 +17,11 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from email.message import EmailMessage
 from typing import Any
 
+import jpholiday
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -33,10 +34,13 @@ from anthropic import Anthropic
 
 JST = timezone(timedelta(hours=9))
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAIL_TO = "ho.atmos.89.ishky@gmail.com"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
+
+# 東証は12/31〜1/3が休場（祝日でなくても）
+YEAR_END_NEW_YEAR: set[tuple[int, int]] = {(12, 31), (1, 1), (1, 2), (1, 3)}
 
 DISCLAIMER = (
     "※本情報は投資勧誘を目的としたものではなく、"
@@ -467,6 +471,104 @@ def generate_report(prompt: str, *, model: str, use_web_search: bool = True) -> 
 
 
 # ---------------------------------------------------------------------------
+# 東証休場日判定
+# ---------------------------------------------------------------------------
+
+def is_tse_closed(d: date) -> bool:
+    """土日 / 日本の祝日 / 年末年始(12/31〜1/3) で東証が休場かを返す。"""
+    if d.weekday() >= 5:  # 土(5) / 日(6)
+        return True
+    if (d.month, d.day) in YEAR_END_NEW_YEAR:
+        return True
+    if jpholiday.is_holiday(d):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# エラー分類（初心者向けの説明文を返す）
+# ---------------------------------------------------------------------------
+
+ERROR_FOOTER = (
+    "\n対応後、GitHub の Actions タブ →「Daily Stock Report」→\n"
+    "「Run workflow」から手動で再実行できます。"
+)
+
+
+def classify_error(exc: Exception) -> tuple[str, str]:
+    """例外を見て、人に伝わる (件名, 本文) を返す。"""
+    msg = str(exc).lower()
+
+    if "credit balance is too low" in msg or "insufficient_quota" in msg:
+        return (
+            "[Daily Stock Report] エラー: Anthropic API クレジット残高不足",
+            "本日のレポート生成を中止しました。\n\n"
+            "■ 原因\n"
+            "Anthropic API のクレジット残高が不足しています。\n\n"
+            "■ 対処\n"
+            "1. https://console.anthropic.com にログイン\n"
+            "2. 左メニューの「Plans & Billing」をクリック\n"
+            "3. 「Add credits」からクレジット ($5 以上) を追加\n"
+            "4. 必要に応じて「Auto-recharge」を有効化"
+            + ERROR_FOOTER,
+        )
+
+    if (
+        "invalid x-api-key" in msg
+        or "invalid api key" in msg
+        or "authentication_error" in msg
+    ):
+        return (
+            "[Daily Stock Report] エラー: Anthropic API キーが無効",
+            "本日のレポート生成を中止しました。\n\n"
+            "■ 原因\n"
+            "Anthropic API キー (ANTHROPIC_API_KEY) が無効か失効しています。\n\n"
+            "■ 対処\n"
+            "1. https://console.anthropic.com → API Keys から新規キーを発行\n"
+            "2. GitHub > Settings > Secrets and variables > Actions で\n"
+            "   ANTHROPIC_API_KEY を更新"
+            + ERROR_FOOTER,
+        )
+
+    if "rate_limit" in msg or "rate limit" in msg or " 429" in msg:
+        return (
+            "[Daily Stock Report] エラー: Anthropic API レート制限",
+            "本日のレポート生成を中止しました。\n\n"
+            "■ 原因\n"
+            "Anthropic API のレート制限に達しました。\n\n"
+            "■ 対処\n"
+            "数十分〜数時間後に再実行してください。\n"
+            "頻発する場合は Plans & Billing から Tier をアップグレードしてください。"
+            + ERROR_FOOTER,
+        )
+
+    if (
+        "smtpauthentication" in msg
+        or "username and password not accepted" in msg
+        or "smtpexception" in msg
+    ):
+        return (
+            "[Daily Stock Report] エラー: Gmail 送信失敗",
+            "Gmail への送信処理でエラーが発生しました。\n\n"
+            "■ 原因\n"
+            "Gmail アプリパスワード (GMAIL_APP_PASSWORD) が無効、\n"
+            "または送信元アドレス (GMAIL_SENDER) と不一致の可能性があります。\n\n"
+            "■ 対処\n"
+            "1. https://myaccount.google.com/apppasswords でパスワードを再発行\n"
+            "2. GitHub Secret の GMAIL_APP_PASSWORD を更新（16文字、スペース無し）"
+            + ERROR_FOOTER,
+        )
+
+    tb = traceback.format_exc()
+    return (
+        "[Daily Stock Report] ERROR",
+        "Daily Stock Recommender でエラーが発生しました。\n"
+        "GitHub Actions のログを確認してください。\n\n"
+        f"{tb}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gmail 通知（SMTP + アプリパスワード）
 # ---------------------------------------------------------------------------
 
@@ -505,9 +607,18 @@ def run(
     skip_notify: bool,
     model: str,
     no_web_search: bool,
+    force: bool,
 ) -> int:
     started = datetime.now(JST)
     print(f"=== Run start: {started.strftime('%Y-%m-%d %H:%M:%S JST')} ===")
+
+    today_jst = started.date()
+    if is_tse_closed(today_jst) and not force:
+        print(
+            f"=== TSE closed today ({today_jst}, "
+            f"weekday={today_jst.strftime('%A')}). Skipping. ==="
+        )
+        return 0
 
     fx = fetch_fx()
     us = fetch_us_market()
@@ -583,6 +694,8 @@ def main() -> int:
                         help="Gmail 通知をスキップ")
     parser.add_argument("--no-web-search", action="store_true",
                         help="Claude の Web Search ツールを無効化")
+    parser.add_argument("--force", action="store_true",
+                        help="東証休場日でも強制実行する")
     parser.add_argument(
         "--model",
         default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL),
@@ -597,18 +710,15 @@ def main() -> int:
             skip_notify=args.skip_notify,
             model=args.model,
             no_web_search=args.no_web_search,
+            force=args.force,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
         print(tb, file=sys.stderr)
         if not args.dry_run and not args.skip_notify:
             try:
-                send_gmail(
-                    "[Daily Stock Report] ERROR",
-                    "Daily Stock Recommender でエラーが発生しました。\n"
-                    "GitHub Actions のログを確認してください。\n\n"
-                    f"{tb}",
-                )
+                subject, body = classify_error(exc)
+                send_gmail(subject, body)
             except Exception:  # noqa: BLE001
                 pass
         return 1

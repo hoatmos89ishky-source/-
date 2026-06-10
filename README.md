@@ -11,7 +11,7 @@
        │                     日経主要30銘柄ユニバース, 保有株の値動き・ニュース・決算予定
        ├─ pandas/numpy     : 25日移動平均線・乖離率, 26週移動平均線, RSI(14)
        ├─ HOLDINGS_JSON    : 保有株(コード/数量/平均取得単価)＋保有投信(ファンド名)
-       ├─ Claude Opus 4.7  : web_search ツールで最新ニュース/決算/世情を参照しレポート生成
+       ├─ Claude Sonnet 4.6: web_search ツールで最新ニュース/決算/世情を参照しレポート生成
        └─ Gmail (SMTP)     : smtp.gmail.com:587 (STARTTLS) で配信
 ```
 
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 | `GMAIL_APP_PASSWORD` | Secret | ✓ | Google アカウントのアプリパスワード16文字 |
 | `HOLDINGS_JSON` | Secret |   | 保有情報 JSON（未設定でも動く。下記参照） |
 | `GMAIL_TO` | Variable |   | 受信先。既定 `ho.atmos.89.ishky@gmail.com` |
-| `ANTHROPIC_MODEL` | Variable |   | 既定 `claude-opus-4-7`（Web Search 対応モデルが必要） |
+| `ANTHROPIC_MODEL` | Variable |   | 既定 `claude-sonnet-4-6`（Web Search 対応モデルが必要） |
 
 ### 3. Anthropic API キーの取得
 
@@ -74,7 +74,7 @@ pip install -r requirements.txt
 2. **Settings → API Keys → Create Key**
 3. キーを `ANTHROPIC_API_KEY` に登録
 
-> Web 検索ツールは Anthropic 側で **1検索 = $0.01** 程度の追加課金。`max_uses=8` 設定なので1配信あたり最大 $0.08（数十円）程度の上乗せです。
+> **コスト目安**: Claude Sonnet 4.6 + Web 検索 で1配信あたり $0.15〜$0.30（数十円）、月間およそ **$5〜$10**。Web 検索ツールは 1検索 = $0.01・`max_uses=8` 設定。残高は <https://console.anthropic.com> の **Plans & Billing** から監視し、必要に応じて **Auto-recharge** を有効化しておくと安心です。残高切れになった場合は専用のエラーメールが届きます。
 
 ### 4. Gmail アプリパスワードの取得手順
 
@@ -171,7 +171,7 @@ python main.py
 - 手動実行: **Actions → Daily Stock Report → Run workflow**（`dry_run=true` で LLM/メールスキップ）
 
 > GitHub Actions の cron は混雑時に遅延します。万一 8:30 を過ぎても届かない日が続く場合は cron をさらに早めるか、別スケジューラ（例: Render Cron など）への移行を検討してください。
-> 祝日判定は行っていません。日本の祝日でも cron は走り、Claude が「東証休場の可能性」を本文冒頭で言及します。
+> 日本の祝日 / 土日 / 年末年始（12/31〜1/3）は **東証休場日として自動でスキップ**し、メールは送信されません。`--force` フラグでローカルから強制実行は可能。
 
 ## CLI フラグ一覧
 
@@ -181,7 +181,8 @@ python main.py
 | `--skip-llm` | Claude 呼び出しを省略（メール送信は試みる） |
 | `--skip-notify` | Gmail 送信を省略 |
 | `--no-web-search` | Claude の Web Search ツールを無効化（コスト節約） |
-| `--model <id>` | モデル ID を上書き（既定 `claude-opus-4-7`） |
+| `--force` | 東証休場日でも強制実行する |
+| `--model <id>` | モデル ID を上書き（既定 `claude-sonnet-4-6`） |
 
 ## 免責事項
 

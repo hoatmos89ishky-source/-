@@ -21,7 +21,7 @@ jobs:
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       HOLDINGS_JSON: ${{ secrets.HOLDINGS_JSON }}
       GMAIL_TO: ${{ vars.GMAIL_TO || 'ho.atmos.89.ishky@gmail.com' }}
-      ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-4-7' }}
+      ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-6' }}
       PYTHONUNBUFFERED: "1"
     steps:
       - name: Checkout
