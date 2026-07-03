@@ -2,10 +2,12 @@
 
 日本時間の平日朝（東京市場の寄り付き前）に、為替・米国市場・日経主要構成銘柄のテクニカル指標と、あなたの**保有株・保有投信**の動向を自動分析し、Claude が **Web 検索で最新の決算・ニュース・世情まで踏まえて**生成した「相場見通し＋おすすめ10銘柄＋保有銘柄の動向と売却判断」レポートを **Gmail** で配信する Bot です。GitHub Actions cron で動くのでローカル常駐不要。
 
+> ⚠ **現在、毎日の自動配信 (cron) は停止中です**。手動実行のみ有効。再開手順は「GitHub Actions」セクション参照。
+
 ## アーキテクチャ
 
 ```
-[GitHub Actions cron 07:30 JST]
+[GitHub Actions 手動実行 (cron は現在停止中)]
   └─ python main.py
        ├─ yfinance         : USD/JPY, NYダウ, NASDAQ, SOX, NVDA, 日経平均,
        │                     日経主要30銘柄ユニバース, 保有株の値動き・ニュース・決算予定
@@ -166,12 +168,10 @@ python main.py
 
 ### GitHub Actions
 
-- cron: `30 22 * * 0-4`（UTC 日〜木 22:30 = **JST 月〜金 07:30**）
-- 寄り付き(09:00) の90分前起動なので、Actions の混雑遅延（典型 5〜15 分、ピーク時 30 分超）と処理時間 1〜2 分を踏まえても余裕で 09:00 前に到着します
-- 手動実行: **Actions → Daily Stock Report → Run workflow**（`dry_run=true` で LLM/メールスキップ）
-
-> GitHub Actions の cron は混雑時に遅延します。万一 8:30 を過ぎても届かない日が続く場合は cron をさらに早めるか、別スケジューラ（例: Render Cron など）への移行を検討してください。
-> 日本の祝日 / 土日 / 年末年始（12/31〜1/3）は **東証休場日として自動でスキップ**し、メールは送信されません。`--force` フラグでローカルから強制実行は可能。
+- **cron による毎日の自動配信は現在停止中です**（`.github/workflows/daily_stock_report.yml` の `schedule:` をコメントアウト）。API コストを避けるための一時停止措置。
+- 手動実行のみ有効: **Actions → Daily Stock Report → Run workflow**（`dry_run=true` で LLM/メールスキップ）
+- 自動配信を再開したい場合は、ワークフローファイル冒頭の `schedule:` ブロックをコメントアウト解除して push（JST 月〜金 07:30 起動）
+- 日本の祝日 / 土日 / 年末年始（12/31〜1/3）は **東証休場日として自動でスキップ**（cron 再開時のみ効く）
 
 ## CLI フラグ一覧
 

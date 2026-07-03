@@ -1,9 +1,10 @@
 name: Daily Stock Report
 
 on:
-  schedule:
-    # JST 月〜金 07:30 = UTC 日〜木 22:30
-    - cron: "30 22 * * 0-4"
+  # 自動配信 (cron) は現在停止中。再開するには下の schedule ブロックを
+  # コメントアウト解除してください:
+  #   schedule:
+  #     - cron: "30 22 * * 0-4"   # JST 月〜金 07:30 = UTC 日〜木 22:30
   workflow_dispatch:
     inputs:
       dry_run:
